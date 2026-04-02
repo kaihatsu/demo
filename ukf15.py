@@ -14,36 +14,29 @@ CONFIG = {
     'fixed_mu': 2.0,        
     'ages': [40, 60],       
     
-    # --- λ (粘着情報) の異質性スイッチ ---
-    'heterogeneous_lambda': False, # True: コーホート別, False: 全世代共通
-    
     'start_date_long': '1954-04-01',  
     'start_date_short': '2004-04-01', 
     'end_date': '2024-03-01',         
     
     'calibrated_theta': 1.5,          
     
-    'mock_csv': 'mock_data_fixed_gamma.csv',              
-    'output_csv': 'endogenous_variables_fixed_gamma.csv', 
-    'params_csv': 'estimated_parameters_fixed_gamma.csv',       
+    'mock_csv': 'mock_data_simplest.csv',              
+    'output_csv': 'endogenous_variables_simplest.csv', 
+    'params_csv': 'estimated_parameters_simplest.csv',       
     
     'init_step1': [0.5, 0.1, 0.2],               
     'bounds_step1': ((0.01, 0.99), (0.01, 5.0), (0.01, 5.0)),
 }
 
-# --- Step 2 推計パラメータ ---
-# [gamma(固定値), sig_lambda, sig_Z, sig_lambda_obs, alpha] + [b_1, b_2, ...]
-CONFIG['init_step2'] = [0.5, 0.05, 0.1, 0.05, 5.0] + [0.3] * CONFIG['C']
-CONFIG['bounds_step2'] = tuple(
-    [(0.01, 0.99), (1e-4, 0.2), (1e-4, 5.0), (1e-4, 1.0), (0.0, 50.0)] + 
-    [(0.05, 0.95)] * CONFIG['C']
+# --- Step 2 推計パラメータ (極限までシンプル化) ---
+# [gamma(固定値), sig_lambda, sig_Z, sig_lambda_obs, alpha, b(共通)]
+CONFIG['init_step2'] = [0.5, 0.05, 0.1, 0.05, 5.0, 0.3]
+CONFIG['bounds_step2'] = (
+    (0.01, 0.99), (1e-4, 0.2), (1e-4, 5.0), (1e-4, 1.0), (0.0, 50.0), (0.05, 0.95)
 )
 
-# ★ 状態変数の次元設定 (時変gammaが消えたため非常にシンプル)
-# X = [pi_t, lambda_tilde_1, lambda_tilde_2] (異質性ありの場合)
-num_lambda_states = CONFIG['C'] if CONFIG['heterogeneous_lambda'] else 1
-DIM_X = 1 + num_lambda_states
-
+# 状態変数 X = [pi_t, lambda_tilde_t(全世代共通)] の2次元のみ！
+DIM_X = 2
 DIM_Z = 1 + CONFIG['C'] + CONFIG['C']
 
 global_dates = pd.date_range(start=CONFIG['start_date_long'], end=CONFIG['end_date'], freq='MS')
@@ -71,17 +64,14 @@ def save_all_parameters(config, res1_x, res2_x, metrics, output_filename):
     add_param('Step 1 (Macro)', 'sig_pi', opt_sig_pi, 'インフレショック標準偏差')
     add_param('Step 1 (Macro)', 'sig_S', opt_sig_S, 'マクロシグナル観測ノイズ')
 
-    opt_gamma, opt_sig_lambda, opt_sig_Z, opt_sig_lambda_obs, opt_alpha = res2_x[:5]
-    opt_b = res2_x[5:5+config['C']]
+    opt_gamma, opt_sig_lambda, opt_sig_Z, opt_sig_lambda_obs, opt_alpha, opt_b = res2_x
     
-    # ★ gamma が時変ショックではなく「固定ウエイト」として保存される
     add_param('Step 2 (Micro)', 'gamma_fixed', opt_gamma, '経験ウエイト(gamma)の固定値')
     add_param('Step 2 (Micro)', 'sig_lambda', opt_sig_lambda, '粘着情報(lambda)の変動ショック')
     add_param('Step 2 (Micro)', 'sig_Z', opt_sig_Z, 'サーベイ観測ノイズ')
     add_param('Step 2 (Micro)', 'sig_lambda_obs', opt_sig_lambda_obs, 'プロキシデータ観測ノイズ')
     add_param('Step 2 (Micro)', 'alpha', opt_alpha, 'ロジスティック関数のインフレ感応度')
-    for i, b_val in enumerate(opt_b):
-        add_param('Step 2 (Micro)', f'b_{i+1}', b_val, f'Cohort {i+1} の偶然留まる確率')
+    add_param('Step 2 (Micro)', 'b_common', opt_b, '偶然留まるベース確率 (全世代共通)')
         
     add_param('Evaluation', 'Log-Likelihood', metrics['LL'], 'モデルの対数尤度')
     add_param('Evaluation', 'AIC', metrics['AIC'], '赤池情報量規準')
@@ -116,28 +106,20 @@ def generate_mock_data():
     S_data = true_pi + np.random.normal(0, true_sig_S, T_long)
     abs_delta_S = np.abs(np.diff(S_data, prepend=S_data[0]))
     
-    true_gamma_fixed = 0.45 # ★ モックデータの gamma も完全な固定値
+    true_gamma_fixed = 0.45 
+    true_b_common = 0.40 # ★ b も共通の固定値に
+    true_alpha = 5.0
     
-    true_lambda = np.zeros((T_long, CONFIG['C']))
-    if CONFIG['heterogeneous_lambda']:
-        true_lambda[0, :] = [0.3, 0.7] 
-    else:
-        true_lambda[0, :] = 0.5
-        
-    true_alpha, true_b = 5.0, [0.4, 0.5]
+    true_lambda = np.zeros(T_long)
+    true_lambda[0] = 0.5
     lambda_obs_data = np.zeros((T_long, CONFIG['C']))
     
     for t in range(1, T_long):
-        if CONFIG['heterogeneous_lambda']:
-            for c in range(CONFIG['C']):
-                true_lambda[t, c] = np.clip(true_lambda[t-1, c] + np.random.normal(0, 0.01), 0.1, 0.9)
-        else:
-            new_lambda = np.clip(true_lambda[t-1, 0] + np.random.normal(0, 0.01), 0.1, 0.9)
-            true_lambda[t, :] = new_lambda
-            
+        true_lambda[t] = np.clip(true_lambda[t-1] + np.random.normal(0, 0.01), 0.1, 0.9)
+        
         for c in range(CONFIG['C']):
-            stay_prob = true_b[c] * (2.0 / (1.0 + np.exp(true_alpha * abs_delta_S[t])))
-            expected_obs = true_lambda[t, c] + (1 - true_lambda[t, c]) * stay_prob
+            stay_prob = true_b_common * (2.0 / (1.0 + np.exp(true_alpha * abs_delta_S[t])))
+            expected_obs = true_lambda[t] + (1 - true_lambda[t]) * stay_prob
             lambda_obs_data[t, c] = expected_obs + np.random.normal(0, 0.03)
             
     Z_data, Z5_data = np.full((T_long, CONFIG['C']), np.nan), np.full((T_long, CONFIG['C']), np.nan)
@@ -157,12 +139,11 @@ def generate_mock_data():
             true_rational_exp_1y = (1 - true_phi**12) * CONFIG['fixed_mu'] + (true_phi**12) * true_pi[t]
             true_rational_exp_5y = (1 - true_phi**60) * CONFIG['fixed_mu'] + (true_phi**60) * true_pi[t]
             
-            # ★ ファンダメンタル予想は固定値 true_gamma_fixed を使用
             Z_star_1y = true_gamma_fixed * true_E_ct + (1 - true_gamma_fixed) * true_rational_exp_1y
-            Z_data[t, c] = (1 - true_lambda[t, c]) * Z_star_1y + true_lambda[t, c] * Z_data[t-1, c] + np.random.normal(0, 0.05)
+            Z_data[t, c] = (1 - true_lambda[t]) * Z_star_1y + true_lambda[t] * Z_data[t-1, c] + np.random.normal(0, 0.05)
             
             Z_star_5y = true_gamma_fixed * true_E_ct + (1 - true_gamma_fixed) * true_rational_exp_5y
-            Z5_data[t, c] = (1 - true_lambda[t, c]) * Z_star_5y + true_lambda[t, c] * Z5_data[t-1, c] + np.random.normal(0, 0.05)
+            Z5_data[t, c] = (1 - true_lambda[t]) * Z_star_5y + true_lambda[t] * Z5_data[t-1, c] + np.random.normal(0, 0.05)
             
     df_mock = pd.DataFrame({'S_t': S_data}, index=global_dates)
     df_mock.index.name = 'Date'
@@ -171,8 +152,8 @@ def generate_mock_data():
         df_mock[f'Z_{c+1}'] = Z_data[:, c]
         df_mock[f'Z5_{c+1}'] = Z5_data[:, c]
         df_mock[f'Lambda_obs_{c+1}'] = lambda_obs_data[:, c]
-        df_mock[f'True_lambda_{c+1}'] = true_lambda[:, c]
         
+    df_mock['True_lambda_Common'] = true_lambda
     df_mock.to_csv(CONFIG['mock_csv'], encoding='utf-8-sig')
 
 def load_csv_data(csv_filepath):
@@ -251,32 +232,28 @@ def compute_exact_mn_experience(pi_hat_long, theta, ages, start_idx_short):
 # 3. Step 2: 拡張 UKF (非線形状態空間モデル)
 # =====================================================================
 def fx(x, dt, phi):
-    """状態推移関数 (gamma が消え、pi と lambda のみを推移させる)"""
     x_next = np.empty_like(x)
     x_next[0] = (1 - phi) * CONFIG['fixed_mu'] + phi * x[0]
-    x_next[1:] = x[1:] 
+    x_next[1] = x[1] # 全世代共通の lambda_tilde がランダムウォーク
     return x_next
 
-def hx(x, E_t, Z_lag, phi, abs_delta_S, b_params, alpha, gamma_fixed):
-    """非線形観測関数 (gamma_fixed は外部パラメータとして受け取る)"""
+def hx(x, E_t, Z_lag, phi, abs_delta_S, b_common, alpha, gamma_fixed):
     pi_t = x[0]
     z = np.zeros(DIM_Z)
     rational_exp_1y = (1 - phi**12) * CONFIG['fixed_mu'] + (phi**12) * pi_t
     z[0] = pi_t
     
+    # 共通の lambda を取得し、シグモイドで 0~1 に収める
+    lambda_c = 1.0 / (1.0 + np.exp(np.clip(-x[1], -500.0, 500.0)))
+    exponent = np.clip(alpha * abs_delta_S, -500.0, 500.0)
+    
+    # 共通の b を使用
+    stay_prob = b_common * (2.0 / (1.0 + np.exp(exponent)))
+    expected_obs_lambda = lambda_c + (1 - lambda_c) * stay_prob
+    
     for c in range(CONFIG['C']):
-        # lambda の潜在変数を取得
-        lambda_tilde = x[1 + c] if CONFIG['heterogeneous_lambda'] else x[1]
-        lambda_c = 1.0 / (1.0 + np.exp(np.clip(-lambda_tilde, -500.0, 500.0)))
-        
-        # ★ Z* の計算に、固定パラメータとして渡された gamma_fixed を使用
         Z_star = gamma_fixed * E_t[c] + (1 - gamma_fixed) * rational_exp_1y
         z[1 + c] = (1 - lambda_c) * Z_star + lambda_c * Z_lag[c]
-        
-        exponent = np.clip(alpha * abs_delta_S, -500.0, 500.0)
-        stay_prob = b_params[c] * (2.0 / (1.0 + np.exp(exponent)))
-        
-        expected_obs_lambda = lambda_c + (1 - lambda_c) * stay_prob
         z[1 + CONFIG['C'] + c] = expected_obs_lambda
         
     return z
@@ -285,18 +262,16 @@ def setup_ukf(opt_phi, opt_sig_pi, opt_sig_S, sig_lambda, sig_Z, sig_lambda_obs)
     points = MerweScaledSigmaPoints(n=DIM_X, alpha=0.1, beta=2., kappa=3-DIM_X)
     ukf = UnscentedKalmanFilter(dim_x=DIM_X, dim_z=DIM_Z, dt=1., fx=fx, hx=hx, points=points)
     
-    ukf.x = np.array([CONFIG['fixed_mu']] + [0.0] * (DIM_X - 1))
-    ukf.P = np.diag([0.5**2] + [2.0**2] * (DIM_X - 1)) 
+    ukf.x = np.array([CONFIG['fixed_mu'], 0.0])
+    ukf.P = np.diag([0.5**2, 2.0**2]) 
     
-    # プロセスノイズ (sig_gamma が消滅)
-    ukf.Q = np.diag([opt_sig_pi**2] + [sig_lambda**2] * num_lambda_states)
+    ukf.Q = np.diag([opt_sig_pi**2, sig_lambda**2])
     ukf.R = np.diag([opt_sig_S**2] + [sig_Z**2]*CONFIG['C'] + [sig_lambda_obs**2]*CONFIG['C'])
     return ukf
 
 def nll_step2(params, S_short_obs, Z_short_obs, lambda_obs_short, Z_lag_short, E_pool, abs_delta_S_short, opt_phi, opt_sig_pi, opt_sig_S):
-    # ★ オプティマイザから現在の固定gamma (opt_gamma) を受け取る
-    opt_gamma, sig_lambda, sig_Z, sig_lambda_obs, alpha = params[:5]
-    b_params = params[5:5+CONFIG['C']] 
+    # ★ 6個のパラメータを展開
+    opt_gamma, sig_lambda, sig_Z, sig_lambda_obs, alpha, b_common = params 
     
     ukf = setup_ukf(opt_phi, opt_sig_pi, opt_sig_S, sig_lambda, sig_Z, sig_lambda_obs)
     ll_total = 0.0
@@ -308,10 +283,8 @@ def nll_step2(params, S_short_obs, Z_short_obs, lambda_obs_short, Z_lag_short, E
         z_t[1+CONFIG['C']:] = lambda_obs_short[t] 
         
         ukf.predict(phi=opt_phi)
-        
-        # ★ hx へ渡す引数に gamma_fixed を追加
         ukf.update(z_t, E_t=E_pool[t], Z_lag=Z_lag_short[t], phi=opt_phi, 
-                   abs_delta_S=abs_delta_S_short[t], b_params=b_params, alpha=alpha, gamma_fixed=opt_gamma)
+                   abs_delta_S=abs_delta_S_short[t], b_common=b_common, alpha=alpha, gamma_fixed=opt_gamma)
         ll_total += ukf.log_likelihood
     return -ll_total
 
@@ -328,14 +301,12 @@ if __name__ == "__main__":
     pi_hat_long = extract_nowcast_path(S_data, res1.x)
     E_pool = compute_exact_mn_experience(pi_hat_long, CONFIG['calibrated_theta'], CONFIG['ages'], CONFIG['start_idx_short'])
     
-    print("--- 2. Step 2: UKF 推計 (固定gamma & 時変lambda) ---")
+    print("--- 2. Step 2: UKF 推計 (固定gamma & 共通b & 共通時変lambda) ---")
     res2 = minimize(nll_step2, CONFIG['init_step2'], 
                     args=(S_short_obs, Z_short_obs, lambda_obs_short, Z_lag_short, E_pool, abs_delta_S_short, opt_phi, opt_sig_pi, opt_sig_S),
                     method='L-BFGS-B', bounds=CONFIG['bounds_step2'])
     
-    # 推計された固定パラメータの抽出
-    opt_gamma, opt_sig_lambda, opt_sig_Z, opt_sig_lambda_obs, opt_alpha = res2.x[:5]
-    opt_b = res2.x[5:5+CONFIG['C']]
+    opt_gamma, opt_sig_lambda, opt_sig_Z, opt_sig_lambda_obs, opt_alpha, opt_b = res2.x
     
     ukf_final = setup_ukf(opt_phi, opt_sig_pi, opt_sig_S, opt_sig_lambda, opt_sig_Z, opt_sig_lambda_obs)
     records = []
@@ -357,7 +328,7 @@ if __name__ == "__main__":
             count_Z += 1
             
         ukf_final.update(z_t, E_t=E_pool[t_short], Z_lag=Z_lag_short[t_short], phi=opt_phi, 
-                         abs_delta_S=abs_delta_S_short[t_short], b_params=opt_b, alpha=opt_alpha, gamma_fixed=opt_gamma)
+                         abs_delta_S=abs_delta_S_short[t_short], b_common=opt_b, alpha=opt_alpha, gamma_fixed=opt_gamma)
         total_log_likelihood += ukf_final.log_likelihood
         
         pi_t = ukf_final.x[0]
@@ -372,15 +343,17 @@ if __name__ == "__main__":
             'Rational_Exp_5y': rational_exp_5y  
         }
         
+        # 共通 lambda_t の算出
+        lambda_c = 1.0 / (1.0 + np.exp(np.clip(-ukf_final.x[1], -500.0, 500.0)))
+        exponent = np.clip(opt_alpha * abs_delta_S_short[t_short], -500.0, 500.0)
+        stay_prob = opt_b * (2.0 / (1.0 + np.exp(exponent)))
+        expected_obs_lambda = lambda_c + (1 - lambda_c) * stay_prob
+        
+        record['State_lambda_Common'] = lambda_c
+        record['Stay_Prob_Common'] = stay_prob
+        record['Expected_Obs_Lambda_Common'] = expected_obs_lambda
+        
         for c in range(CONFIG['C']):
-            lambda_tilde = ukf_final.x[1 + c] if CONFIG['heterogeneous_lambda'] else ukf_final.x[1]
-            lambda_c = 1.0 / (1.0 + np.exp(np.clip(-lambda_tilde, -500.0, 500.0)))
-            
-            exponent = np.clip(opt_alpha * abs_delta_S_short[t_short], -500.0, 500.0)
-            stay_prob = opt_b[c] * (2.0 / (1.0 + np.exp(exponent)))
-            expected_obs_lambda = lambda_c + (1 - lambda_c) * stay_prob
-            
-            # 記録・計算にはすべて固定された opt_gamma を使用
             Z_star_1y = opt_gamma * E_pool[t_short, c] + (1 - opt_gamma) * rational_exp_1y
             Household_Exp_1y = (1 - lambda_c) * Z_star_1y + lambda_c * Z_lag_short[t_short, c]
             
@@ -391,20 +364,17 @@ if __name__ == "__main__":
             Household_Exp_5y = (1 - lambda_c) * Z_star_5y + lambda_c * implied_Z5_lag[c]
             implied_Z5_lag[c] = Household_Exp_5y 
             
-            record[f'State_lambda_{c+1}'] = lambda_c
             record[f'Household_Exp_1y_{c+1}'] = Household_Exp_1y 
             record[f'Household_Exp_5y_{c+1}'] = Household_Exp_5y 
             record[f'Fund_Z_star_1y_{c+1}'] = Z_star_1y
             record[f'Fund_Z_star_5y_{c+1}'] = Z_star_5y
-            record[f'Stay_Prob_{c+1}'] = stay_prob
-            record[f'Expected_Obs_Lambda_{c+1}'] = expected_obs_lambda
             record[f'Actual_Obs_Lambda_{c+1}'] = lambda_obs_short[t_short, c]
             record[f'Obs_Z_{c+1}'] = Z_short_obs[t_short, c]
             record[f'Experience_E_{c+1}'] = E_pool[t_short, c] 
             
         records.append(record)
         
-    k_params_step2 = 5 + CONFIG['C'] 
+    k_params_step2 = 6 # [gamma, sig_lambda, sig_Z, sig_lambda_obs, alpha, b_common]
     aic = -2 * total_log_likelihood + 2 * k_params_step2
     bic = -2 * total_log_likelihood + k_params_step2 * np.log(CONFIG['T_short'])
     
@@ -424,7 +394,7 @@ if __name__ == "__main__":
     save_all_parameters(CONFIG, res1.x, res2.x, eval_metrics, CONFIG['params_csv'])
     
     print("\n" + "="*50)
-    print(" 📊 MODEL EVALUATION METRICS (Fixed Gamma Model)")
+    print(" 📊 MODEL EVALUATION METRICS (Simplest Model)")
     print("="*50)
     print(f" [Model Fit]")
     print(f" Log-Likelihood : {total_log_likelihood:.2f}")
@@ -436,21 +406,19 @@ if __name__ == "__main__":
     print(f" RMSE (Explanatory): {rmse_expl:.4f} (Filtered residual)")
     print(f"")
     print(f" [Structural Parameters]")
-    print(f" ★ Estimated FIXED Gamma (Weight on Experience) : {opt_gamma:.4f}")
+    print(f" Estimated FIXED Gamma (Weight on Experience)   : {opt_gamma:.4f}")
     print(f" Estimated Alpha (Logistic Sensitivity)         : {opt_alpha:.4f}")
-    for c in range(CONFIG['C']):
-        print(f" Estimated Base Stay Prob b_{c+1}                : {opt_b[c]:.4f}")
+    print(f" Estimated COMMON Base Stay Prob b              : {opt_b:.4f}")
     print("="*50 + "\n")
     
     # -----------------------------------------------------------------
-    # ★ グラフの描画 (gammaが固定になったため、3つのパネル構成に変更)
+    # ★ グラフの描画
     # -----------------------------------------------------------------
     fig, axes = plt.subplots(3, 1, figsize=(12, 14), sharex=True)
     
-    t_lambda = "Heterogeneous" if CONFIG['heterogeneous_lambda'] else "Homogeneous"
-    fig.suptitle(f'Extended UKF (Fixed $\gamma$ = {opt_gamma:.2f}, $\lambda$: {t_lambda})', fontsize=16)
+    fig.suptitle(f'Extended UKF (Fixed $\gamma$ = {opt_gamma:.2f}, Common $\lambda_t$ & $b$)', fontsize=16)
 
-    # パネル1: インフレ動学
+    # パネル1: インフレ
     axes[0].plot(df_endogenous.index, df_endogenous['Obs_S'], label='Observed Signal $S_t$', color='gray', alpha=0.5)
     axes[0].plot(df_endogenous.index, df_endogenous['State_pi_t'], label='Filtered $\pi_t$', color='blue', linewidth=2)
     axes[0].axhline(CONFIG['fixed_mu'], color='red', linestyle='--', label='Long-term Target $\mu$')
@@ -459,17 +427,13 @@ if __name__ == "__main__":
     axes[0].legend(loc='upper right')
     axes[0].grid(True, alpha=0.3)
 
-    # パネル2: 粘着情報(lambda)
+    # パネル2: 共通粘着情報(lambda)
     for c in range(CONFIG['C']):
         axes[1].plot(df_endogenous.index, df_endogenous[f'Actual_Obs_Lambda_{c+1}'], color=f'C{c}', alpha=0.3, label=f'Proxy Obs (C{c+1})')
         
-    if CONFIG['heterogeneous_lambda']:
-        for c in range(CONFIG['C']):
-            axes[1].plot(df_endogenous.index, df_endogenous[f'State_lambda_{c+1}'], color=f'C{c}', linewidth=2, label=f'Filtered $\lambda_{{{c+1},t}}$')
-    else:
-        axes[1].plot(df_endogenous.index, df_endogenous['State_lambda_1'], color='black', linewidth=2.5, label='Filtered $\lambda_t$ (Common)')
+    axes[1].plot(df_endogenous.index, df_endogenous['State_lambda_Common'], color='black', linewidth=2.5, label='Filtered Common $\lambda_t$')
         
-    axes[1].set_title('Time-Varying Sticky Information ($\lambda$) vs Upward Biased Proxy Data')
+    axes[1].set_title('Time-Varying Common Sticky Information ($\lambda_t$) vs Upward Biased Proxy Data')
     axes[1].set_ylabel('Sticky Info $\lambda$')
     axes[1].set_ylim(0, 1.1)
     axes[1].legend(loc='upper right', ncol=2, fontsize='small')
